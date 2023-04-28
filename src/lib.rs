@@ -13,9 +13,8 @@ use std::thread;
 
 enum Operation<K, V> {
     Insert(K, V),
-    Update(K, V),
     Remove(K),
-    Fetch(K, Arc<Mutex<Option<Arc<V>>>>),
+    Fetch(K, Arc<Mutex<Option<Option<Arc<V>>>>>),
     StartUpdateLeft(K),
     FinishUpdateLeft(K),
     StartUpdateRight(K),
@@ -25,7 +24,7 @@ enum Operation<K, V> {
 /// A Fence is a worker responsible for a part of the set
 struct Fence<K, V> where K: Ord {
     /// The set this fence is responsible for
-    main: BTreeMap<K, Arc<V>>,
+    resp: BTreeMap<K, Arc<V>>,
 
     left: Option<mpsc::Sender<Operation<K, V>>>,
     right: Option<mpsc::Sender<Operation<K, V>>>,
@@ -33,7 +32,34 @@ struct Fence<K, V> where K: Ord {
 }
 
 impl<K: Ord, V> Fence<K, V> {
+    fn execute_op(&mut self, op: Operation<K, V>) {
+        match op {
+            Operation::Insert(key, val) => self.insert(key, val),
+            Operation::Remove(_) => todo!(),
+            Operation::Fetch(key, av) => self.fetch(key, av),
+            Operation::StartUpdateLeft(_) => todo!(),
+            Operation::FinishUpdateLeft(_) => todo!(),
+            Operation::StartUpdateRight(_) => todo!(),
+            Operation::FinishUpdateRight(_) => todo!(),
+        }
+    }
 
+    fn insert(&mut self, key: K, val: V) {
+        self.resp.insert(key, val.into());
+    }
+
+    fn remove(&mut self, key: K) {
+        self.resp.remove(&key);
+    }
+
+    fn fetch(&mut self, key: K, dest: Arc<Mutex<Option<Option<Arc<V>>>>>) {
+        let mut d = dest.lock().unwrap();
+        if let Some(res) = self.resp.get(&key) {
+            d.replace(Some(res.clone()));
+        } else {
+            d.replace(None);
+        }
+    }
 }
 
 
@@ -49,11 +75,11 @@ struct FenceReader<'a, K, V> where K: Ord {
 }
 
 struct ReadFuture<V> {
-    val: Arc<Mutex<Option<Arc<V>>>>
+    val: Arc<Mutex<Option<Option<Arc<V>>>>>
 }
 
 impl<V> Future for ReadFuture<V> {
-    type Output = Arc<V>;
+    type Output = Option<Arc<V>>;
 
     fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
         let Some(mut guard) = self.val.try_lock().ok() else { return Poll::Pending };
