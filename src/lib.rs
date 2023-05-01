@@ -1,16 +1,15 @@
 #![allow(dead_code)]
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::ops::Add;
-use std::ops::AddAssign;
 use std::ops::Range;
-use std::ops::Sub;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::task::Poll;
 use std::thread;
+use std::time::Instant;
 
 
 enum Operation<V> {
@@ -21,7 +20,8 @@ enum Operation<V> {
     AddRight(Sender<Operation< V>>),
     RemoveLeft,
     RemoveRight,
-    UpdateRange(Range<u64>),
+    UpdateLower(u64),
+    UpdateUpper(u64),
     Drop
 }
 
@@ -30,16 +30,19 @@ struct Fence<V> {
     /// The set this fence is responsible for
     resp: BTreeMap<u64, Arc<V>>,
 
+    id: usize,
+
     left:  Option<Sender<Operation<V>>>,
     right: Option<Sender<Operation<V>>>,
-    reject: Sender<Operation<V>>,
     queue: Receiver<Operation<V>>,
-    bounds: Range<u64>
+    bounds: Range<u64>,
+    ops_since_rebalance: u64,
+    last_rebalance: Instant
 }
 
 impl<V> Fence<V> {
-    fn new(rx: Receiver<Operation<V>>, reject: Sender<Operation<V>>, bounds: Range<u64>) -> Self {
-        Self { resp: Default::default(), left: None, right: None, queue: rx, bounds, reject}
+    fn new(rx: Receiver<Operation<V>>, bounds: Range<u64>, id: usize) -> Self {
+        Self { resp: Default::default(), left: None, right: None, queue: rx, bounds, ops_since_rebalance: 0, last_rebalance: Instant::now(), id}
     }
 
     fn execute(&mut self) {
@@ -53,7 +56,8 @@ impl<V> Fence<V> {
                 Operation::AddRight(r) => self.right = Some(r),
                 Operation::RemoveLeft => self.left = None,
                 Operation::RemoveRight => self.right = None,
-                Operation::UpdateRange(r) => self.bounds = r,
+                Operation::UpdateLower(r) => self.bounds.start = r,
+                Operation::UpdateUpper(r) => self.bounds.end = r,
                 Operation::Drop => return,
             }
         }
@@ -76,113 +80,112 @@ impl<V> Fence<V> {
     fn insert(&mut self, key: u64, val: V) {
         if self.bounds.contains(&key) {
             self.resp.insert(key, val.into());
+        } else if key < self.bounds.start {
+            self.left.as_mut().expect("key less than bounds implies left fence").send(Operation::Insert(key, val)).unwrap();
         } else {
-            self.reject.send(Operation::Insert(key, val)).unwrap();
+            self.right.as_mut().expect("key gte bounds implies right fence").send(Operation::Insert(key, val)).unwrap();
         }
     }
 
     fn remove(&mut self, key: u64) {
         if self.bounds.contains(&key) {
             self.resp.remove(&key);
+        } else if key < self.bounds.start {
+            self.left.as_mut().expect("key less than bounds implies left fence").send(Operation::Remove(key)).unwrap();
         } else {
-            self.reject.send(Operation::Remove(key)).unwrap();
+            self.right.as_mut().expect("key gte bounds implies right fence").send(Operation::Remove(key)).unwrap();
         }
     }
 
     fn fetch(&mut self, key: u64, dest: Arc<Mutex<Option<Option<Arc<V>>>>>) {
-        let mut d = dest.lock().unwrap();
-        if let Some(res) = self.resp.get(&key) {
-            d.replace(Some(res.clone()));
+        if self.bounds.contains(&key) {
+            let mut d = dest.lock().unwrap();
+            if let Some(res) = self.resp.get(&key) {
+                d.replace(Some(res.clone()));
+            } else {
+                d.replace(None);
+            }
+        } else if key < self.bounds.start {
+            self.left.as_mut().expect("key less than bounds implies left fence").send(Operation::Fetch(key, dest)).unwrap();
         } else {
-            d.replace(None);
+            self.right.as_mut().expect("key gte bounds implies right fence").send(Operation::Fetch(key, dest)).unwrap();
         }
+
     }
 }
 
 
-struct FenceMap<V> {
-    fences: Vec<mpsc::Sender<Operation<V>>>,
-    incoming: mpsc::Receiver<Operation<V>>,
-    bounds: Range<u64>,
-    recv: mpsc::Sender<Operation<V>>
+struct FenceMap<const F: usize, V> {
+    fences: [mpsc::Sender<Operation<V>>; F],
+
+    /// The dividing line between fences, as a half-open interval, unbounded at the end. In
+    /// practice, it's actually `u64::MAX`, exclusive.
+    ///
+    /// A job goes to the first fence where `posts[idx] <= key`
+    posts: [AtomicU64; F],
 }
 
-impl<V> FenceMap<V> 
+impl<const F: usize, V> FenceMap<F, V> 
 where 
     V: Send + Sync + 'static 
 {
-    pub fn new(bounds: Range<u64>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let mut ret = Self { 
-            fences: Default::default(),
-            incoming: rx,
-            recv: tx,
-            bounds: bounds.clone()
+    pub fn new() -> Self {
+        let interval = u64::MAX / F as u64;
+        let posts = core::array::from_fn(|i| (i as u64 * interval).into());
+
+        let fences = core::array::from_fn(|i| {
+            let (fencetx, fencerx) = mpsc::channel();
+
+            let bounds = (i as u64 * interval)..(i as u64 * (interval + 1));
+            let mut fence: Fence<V> = Fence::new(fencerx, bounds, i);
+            thread::spawn(move || {
+                fence.execute();
+            });
+            fencetx
+        });
+
+        fences.windows(2).map(|s| match s {
+            [l, r] => {
+                l.send(Operation::AddRight(r.clone())).unwrap();
+                r.send(Operation::AddLeft(l.clone())).unwrap();
+            },
+            _ => panic!("windows 2 should only have 2")
+        }).last();
+
+        let ret = Self { 
+            fences,
+            posts
         };
-
-
-        ret.add_fence(bounds);
 
         ret
     }
 
-    fn process(&mut self) {
-        let op = self.incoming.recv().unwrap();
-        match op {
-            Operation::Insert(_, _) => todo!(),
-            Operation::Remove(_) => todo!(),
-            Operation::Fetch(_, _) => todo!(),
-            Operation::AddLeft(_) => todo!(),
-            Operation::AddRight(_) => todo!(),
-            Operation::RemoveLeft => todo!(),
-            Operation::RemoveRight => todo!(),
-            Operation::UpdateRange(_) => todo!(),
-            Operation::Drop => todo!(),
+
+    pub fn reader(&self) -> FenceReader<F, V> {
+        FenceReader {
+            fences: &self.fences,
+            posts: &self.posts,
         }
     }
 
-    fn add_fence(&mut self, bounds: Range<u64>) {
-        let (tx, rx) = mpsc::channel();
-
-
-        let mut fence: Fence<V> = Fence {
-            resp: Default::default(),
-            left: None,
-            right: None,
-            queue: rx,
-            bounds,
-            reject: self.recv.clone()
-        };
-
-        if let Some(ref mut last) = self.fences.last_mut() {
-            fence.left = Some(last.clone());
-            last.send(Operation::AddRight(tx.clone())).unwrap();
+    pub fn writer(&self) -> FenceWriter<F, V> {
+        FenceWriter {
+            fences: &self.fences,
+            posts: &self.posts,
         }
-
-        thread::spawn(move || {
-            fence.execute();
-        });
-
-        self.fences.push(tx);
-    }
-
-    pub fn reader(&self) -> FenceReader<V> {
-        FenceReader { sender: self.recv.clone() }
-    }
-
-    pub fn writer(&self) -> FenceWriter<V> {
-        FenceWriter { sender: self.recv.clone() }
     }
 }
 
 /// This should eventually be updated to reference the list of fences
-struct FenceWriter<V> {
-    sender: Sender<Operation<V>>
+struct FenceWriter<'a, const F: usize, V> {
+    fences: &'a [Sender<Operation<V>>; F],
+    posts: &'a [AtomicU64]
 }
 
 
-struct FenceReader<V> {
-    sender: Sender<Operation<V>>
+struct FenceReader<'a, const F: usize, V> {
+    fences: &'a [Sender<Operation<V>>; F],
+    posts: &'a [AtomicU64]
 }
 
 struct ReadFuture<V> {
@@ -201,12 +204,14 @@ impl<V> Future for ReadFuture<V> {
     }
 }
 
-impl<V> FenceReader<V>{
+impl<const F: usize, V> FenceReader<'_, F, V>{
     async fn read(&self, key: u64) -> ReadFuture<V> {
         let rf = ReadFuture { 
             val: Arc::new(Mutex::new(None))
         };
-        self.sender.send(Operation::Fetch(key, rf.val.clone())).unwrap();
+
+        let idx = self.posts.iter().enumerate().find(|(_, x)| x.load(std::sync::atomic::Ordering::Relaxed) >= key).unwrap().0;
+        self.fences[idx].send(Operation::Fetch(key, rf.val.clone())).unwrap();
         rf
     }
 }
