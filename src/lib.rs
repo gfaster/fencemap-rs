@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
@@ -15,9 +16,9 @@ use std::time::Instant;
 enum Operation<V> {
     Insert(u64, V),
     Remove(u64),
-    Fetch(u64, Arc<Mutex<Option<Option<Arc<V>>>>>),
-    AddLeft(Sender<Operation< V>>),
-    AddRight(Sender<Operation< V>>),
+    Fetch(u64, Arc<(Condvar, Mutex<Option<Option<Arc<V>>>>)>),
+    AddLeft(Sender<Operation<V>>),
+    AddRight(Sender<Operation<V>>),
     RemoveLeft,
     RemoveRight,
     UpdateLower(u64),
@@ -48,6 +49,7 @@ impl<V> Fence<V> {
     fn execute(&mut self) {
         loop {
             let op = self.queue.recv().expect("fence worker can recieve");
+            self.ops_since_rebalance += 1;
             match op {
                 Operation::Insert(key, val) => self.insert(key, val),
                 Operation::Remove(key) => self.remove(key),
@@ -78,6 +80,7 @@ impl<V> Fence<V> {
     }
 
     fn insert(&mut self, key: u64, val: V) {
+        // eprintln!("Insert {key} at in fence {}", self.id);
         if self.bounds.contains(&key) {
             self.resp.insert(key, val.into());
         } else if key < self.bounds.start {
@@ -97,14 +100,16 @@ impl<V> Fence<V> {
         }
     }
 
-    fn fetch(&mut self, key: u64, dest: Arc<Mutex<Option<Option<Arc<V>>>>>) {
+    fn fetch(&mut self, key: u64, dest: Arc<(Condvar, Mutex<Option<Option<Arc<V>>>>)>) {
+        // eprintln!("Fetch {key} at in fence {}", self.id);
         if self.bounds.contains(&key) {
-            let mut d = dest.lock().unwrap();
+            let mut d = dest.1.lock().unwrap();
             if let Some(res) = self.resp.get(&key) {
                 d.replace(Some(res.clone()));
             } else {
                 d.replace(None);
             }
+            dest.0.notify_one();
         } else if key < self.bounds.start {
             self.left.as_mut().expect("key less than bounds implies left fence").send(Operation::Fetch(key, dest)).unwrap();
         } else {
@@ -136,7 +141,14 @@ where
         let fences = core::array::from_fn(|i| {
             let (fencetx, fencerx) = mpsc::channel();
 
-            let bounds = (i as u64 * interval)..(i as u64 * (interval + 1));
+            let bounds = (i as u64 * interval)..{
+                if i != F - 1 {
+                    (i as u64 + 1) * interval
+                } else  {
+                    u64::MAX
+                }
+            };
+            eprintln!("Fence {i} has bounds {bounds:?}");
             let mut fence: Fence<V> = Fence::new(fencerx, bounds, i);
             thread::spawn(move || {
                 fence.execute();
@@ -176,27 +188,43 @@ where
     }
 }
 
-/// This should eventually be updated to reference the list of fences
+#[inline]
+fn find_post<const F: usize>(posts: &[AtomicU64; F], key: u64) -> usize {
+    posts.iter().enumerate().find(|(_, x)| x.load(std::sync::atomic::Ordering::Relaxed) >= key).map_or(F - 1, |(i, _)| i - 1)
+}
+
 struct FenceWriter<'a, const F: usize, V> {
     fences: &'a [Sender<Operation<V>>; F],
-    posts: &'a [AtomicU64]
+    posts: &'a [AtomicU64; F]
+}
+
+impl<const F: usize, V> FenceWriter<'_, F, V> {
+    fn insert(&self, key: u64, val: V) {
+        let post = find_post(self.posts, key);
+        self.fences[post].send(Operation::Insert(key, val)).unwrap();
+    }
+
+    fn delete(&self, key: u64) {
+        let post = find_post(self.posts, key);
+        self.fences[post].send(Operation::Remove(key)).unwrap();
+    }
 }
 
 
 struct FenceReader<'a, const F: usize, V> {
     fences: &'a [Sender<Operation<V>>; F],
-    posts: &'a [AtomicU64]
+    posts: &'a [AtomicU64; F]
 }
 
 struct ReadFuture<V> {
-    val: Arc<Mutex<Option<Option<Arc<V>>>>>
+    val: Arc<(Condvar, Mutex<Option<Option<Arc<V>>>>)>,
 }
 
 impl<V> Future for ReadFuture<V> {
     type Output = Option<Arc<V>>;
 
     fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        let Some(mut guard) = self.val.try_lock().ok() else { return Poll::Pending };
+        let Some(mut guard) = self.val.1.try_lock().ok() else { return Poll::Pending };
         match guard.take() {
             Some(val) => Poll::Ready(val),
             None => Poll::Pending,
@@ -205,13 +233,79 @@ impl<V> Future for ReadFuture<V> {
 }
 
 impl<const F: usize, V> FenceReader<'_, F, V>{
-    async fn read(&self, key: u64) -> ReadFuture<V> {
+    async fn read_async(&self, key: u64) -> ReadFuture<V> {
         let rf = ReadFuture { 
-            val: Arc::new(Mutex::new(None))
+            val: Arc::new((Condvar::new(), Mutex::new(None))),
         };
-
-        let idx = self.posts.iter().enumerate().find(|(_, x)| x.load(std::sync::atomic::Ordering::Relaxed) >= key).unwrap().0;
-        self.fences[idx].send(Operation::Fetch(key, rf.val.clone())).unwrap();
+        let post = find_post(self.posts, key);
+        self.fences[post].send(Operation::Fetch(key, rf.val.clone())).unwrap();
         rf
+    }
+
+    fn read(&self, key: u64) -> Option<Arc<V>> {
+        let res = Arc::new((Condvar::new(), Mutex::new(None)));
+        let post = find_post(self.posts, key);
+        self.fences[post].send(Operation::Fetch(key, res.clone())).unwrap();
+        
+        let (cvar, lock) = &*res;
+        let guard = cvar.wait_while(lock.lock().unwrap(), |wait| wait.is_none()).unwrap();
+        guard.as_ref().expect("waited until read is done").clone()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn trivial_insert_read() {
+        let map: FenceMap<1, i32> = FenceMap::new();
+
+        let writer = map.writer();
+        let reader = map.reader();
+
+        writer.insert(17, 22);
+        let val = reader.read(17).unwrap();
+        assert_eq!(22, *val);
+    }
+
+    #[test]
+    fn trivial_multiinsert_read() {
+        let map: FenceMap<1, i32> = FenceMap::new();
+
+        let writer = map.writer();
+        let reader = map.reader();
+
+        writer.insert(17, 22);
+        writer.insert(18, 23);
+        assert_eq!(22, *reader.read(17).unwrap());
+    }
+
+    #[test]
+    fn dual_multiinsert_read() {
+        let map: FenceMap<2, i32> = FenceMap::new();
+
+        let writer = map.writer();
+        let reader = map.reader();
+
+        writer.insert(17, 22);
+        writer.insert(18, 23);
+        assert_eq!(22, *reader.read(17).unwrap());
+        assert_eq!(23, *reader.read(18).unwrap());
+    }
+
+    #[test]
+    fn dual_multichannel() {
+        let map: FenceMap<2, i32> = FenceMap::new();
+
+        let writer = map.writer();
+        let reader = map.reader();
+
+        let key_high = u64::MAX - 18;
+
+        writer.insert(17, 22);
+        writer.insert(key_high, 23);
+        assert_eq!(22, *reader.read(17).unwrap());
+        assert_eq!(23, *reader.read(key_high).unwrap());
     }
 }
