@@ -12,6 +12,7 @@ use std::task::Poll;
 use std::thread;
 use std::time::Instant;
 
+const MAX_OP_PER_SECOND: usize = 10_000_000;
 
 enum Operation<V> {
     Insert(u64, V),
@@ -23,6 +24,7 @@ enum Operation<V> {
     RemoveRight,
     UpdateLower(u64),
     UpdateUpper(u64),
+    NOP,
     Drop
 }
 
@@ -48,7 +50,7 @@ impl<V> Fence<V> {
 
     fn execute(&mut self) {
         loop {
-            let op = self.queue.recv().expect("fence worker can recieve");
+            let op = self.queue.recv().unwrap_or(Operation::NOP);
             self.ops_since_rebalance += 1;
             match op {
                 Operation::Insert(key, val) => self.insert(key, val),
@@ -60,6 +62,7 @@ impl<V> Fence<V> {
                 Operation::RemoveRight => self.right = None,
                 Operation::UpdateLower(r) => self.bounds.start = r,
                 Operation::UpdateUpper(r) => self.bounds.end = r,
+                Operation::NOP => (),
                 Operation::Drop => return,
             }
         }
@@ -120,7 +123,7 @@ impl<V> Fence<V> {
 }
 
 
-struct FenceMap<const F: usize, V> {
+pub struct FenceMap<const F: usize, V> {
     fences: [mpsc::Sender<Operation<V>>; F],
 
     /// The dividing line between fences, as a half-open interval, unbounded at the end. In
@@ -175,48 +178,56 @@ where
 
     pub fn reader(&self) -> FenceReader<F, V> {
         FenceReader {
-            fences: &self.fences,
+            fences: self.fences.clone(),
             posts: &self.posts,
         }
     }
 
     pub fn writer(&self) -> FenceWriter<F, V> {
         FenceWriter {
-            fences: &self.fences,
+            fences: self.fences.clone(),
             posts: &self.posts,
+        }
+    }
+}
+
+impl<const F: usize, T> Drop for FenceMap<F, T> {
+    fn drop(&mut self) {
+        for fence in &self.fences {
+            fence.send(Operation::Drop).unwrap();
         }
     }
 }
 
 #[inline]
 fn find_post<const F: usize>(posts: &[AtomicU64; F], key: u64) -> usize {
-    posts.iter().enumerate().find(|(_, x)| x.load(std::sync::atomic::Ordering::Relaxed) >= key).map_or(F - 1, |(i, _)| i - 1)
+    posts.iter().enumerate().find(|(_, x)| x.load(std::sync::atomic::Ordering::Relaxed) > key).map_or(F - 1, |(i, _)| i - 1)
 }
 
-struct FenceWriter<'a, const F: usize, V> {
-    fences: &'a [Sender<Operation<V>>; F],
+pub struct FenceWriter<'a, const F: usize, V> {
+    fences: [Sender<Operation<V>>; F],
     posts: &'a [AtomicU64; F]
 }
 
 impl<const F: usize, V> FenceWriter<'_, F, V> {
-    fn insert(&self, key: u64, val: V) {
+    pub fn insert(&self, key: u64, val: V) {
         let post = find_post(self.posts, key);
         self.fences[post].send(Operation::Insert(key, val)).unwrap();
     }
 
-    fn delete(&self, key: u64) {
+    pub fn delete(&self, key: u64) {
         let post = find_post(self.posts, key);
         self.fences[post].send(Operation::Remove(key)).unwrap();
     }
 }
 
 
-struct FenceReader<'a, const F: usize, V> {
-    fences: &'a [Sender<Operation<V>>; F],
+pub struct FenceReader<'a, const F: usize, V> {
+    fences: [Sender<Operation<V>>; F],
     posts: &'a [AtomicU64; F]
 }
 
-struct ReadFuture<V> {
+pub struct ReadFuture<V> {
     val: Arc<(Condvar, Mutex<Option<Option<Arc<V>>>>)>,
 }
 
@@ -233,7 +244,7 @@ impl<V> Future for ReadFuture<V> {
 }
 
 impl<const F: usize, V> FenceReader<'_, F, V>{
-    async fn read_async(&self, key: u64) -> ReadFuture<V> {
+    pub async fn read_async(&self, key: u64) -> ReadFuture<V> {
         let rf = ReadFuture { 
             val: Arc::new((Condvar::new(), Mutex::new(None))),
         };
@@ -242,7 +253,7 @@ impl<const F: usize, V> FenceReader<'_, F, V>{
         rf
     }
 
-    fn read(&self, key: u64) -> Option<Arc<V>> {
+    pub fn read(&self, key: u64) -> Option<Arc<V>> {
         let res = Arc::new((Condvar::new(), Mutex::new(None)));
         let post = find_post(self.posts, key);
         self.fences[post].send(Operation::Fetch(key, res.clone())).unwrap();
@@ -255,6 +266,8 @@ impl<const F: usize, V> FenceReader<'_, F, V>{
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -307,5 +320,63 @@ mod test {
         writer.insert(key_high, 23);
         assert_eq!(22, *reader.read(17).unwrap());
         assert_eq!(23, *reader.read(key_high).unwrap());
+    }
+
+    #[test]
+    fn many_channel() {
+        let map = Box::leak(Box::new(FenceMap::<25, i32>::new()));
+
+        let keys: Arc<Vec<_>> = (0..1000).map(|i| i * (i32::MAX as u64 / 6000)).collect::<Vec<_>>().into();
+        let chunk_cnt = keys.chunks(300).count();
+
+        let threads: Vec<_> = (0..chunk_cnt).map(|i| {
+            let keys = keys.clone();
+            let writer = map.writer();
+            thread::spawn(move || {
+                let chunk = keys.chunks(3000).collect::<Vec<_>>()[i];
+                chunk.iter().for_each( |key| writer.insert(*key, *key as i32 + 18))
+            })
+        }).collect();
+
+        threads.into_iter().map(|t| t.join()).last();
+
+        thread::sleep(Duration::new(0, 100_000_000));
+
+        let reader = map.reader();
+
+        for key in keys.iter() {
+            assert_eq!(*key as i32 + 18, *reader.read(*key).unwrap());
+        }
+    }
+
+
+    #[test]
+    fn very_many_channel() {
+        let map = Box::leak(Box::new(FenceMap::<250, usize>::new()));
+
+        let range = 0..3000;
+        let chunk_cnt = 3000;
+
+        let thread_writers: Vec<_> = (0..chunk_cnt).map(|i| {
+            let writer = map.writer();
+            let range_thread = range.clone();
+            thread::spawn(move || {
+                let chunk = (i * range_thread.len())..((i + 1) * range_thread.len());
+                chunk.for_each( |key| writer.insert(key as u64, key + 18))
+            })
+        }).collect();
+        thread_writers.into_iter().map(|t| t.join().unwrap()).last();
+
+        thread::sleep(Duration::new(0, 100_000_000));
+
+        let thread_readers: Vec<_> = (0..chunk_cnt).map(|i| {
+            let reader = map.reader();
+            let range_thread = range.clone();
+            thread::spawn(move || {
+                let chunk = (i * range_thread.len())..((i + 1) * range_thread.len());
+                chunk.for_each( |key| assert_eq!(key + 18, *reader.read(key as u64).unwrap()))
+            })
+        }).collect();
+        thread_readers.into_iter().map(|t| t.join().unwrap()).last();
     }
 }
