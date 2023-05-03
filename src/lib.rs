@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -8,7 +7,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::task::Poll;
 use std::thread;
 use std::time::Instant;
 
@@ -227,32 +225,7 @@ pub struct FenceReader<'a, const F: usize, V> {
     posts: &'a [AtomicU64; F]
 }
 
-pub struct ReadFuture<V> {
-    val: Arc<(Condvar, Mutex<Option<Option<Arc<V>>>>)>,
-}
-
-impl<V> Future for ReadFuture<V> {
-    type Output = Option<Arc<V>>;
-
-    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        let Some(mut guard) = self.val.1.try_lock().ok() else { return Poll::Pending };
-        match guard.take() {
-            Some(val) => Poll::Ready(val),
-            None => Poll::Pending,
-        }
-    }
-}
-
 impl<const F: usize, V> FenceReader<'_, F, V>{
-    pub async fn read_async(&self, key: u64) -> ReadFuture<V> {
-        let rf = ReadFuture { 
-            val: Arc::new((Condvar::new(), Mutex::new(None))),
-        };
-        let post = find_post(self.posts, key);
-        self.fences[post].send(Operation::Fetch(key, rf.val.clone())).unwrap();
-        rf
-    }
-
     pub fn read(&self, key: u64) -> Option<Arc<V>> {
         let res = Arc::new((Condvar::new(), Mutex::new(None)));
         let post = find_post(self.posts, key);
